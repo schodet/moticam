@@ -31,6 +31,8 @@
 #include <time.h>
 #include <string.h>
 #include <stdbool.h>
+#include <printf.h>
+#include <png.h>
 
 #define ID_VENDOR 0x232f
 #define ID_PRODUCT 0x0100
@@ -41,6 +43,7 @@ struct options {
     double exposure;
     double gain;
     int count;
+    bool raw;
     const char *out;
 };
 
@@ -55,7 +58,8 @@ usage(int status, const char *msg)
 	    "Moticam 3+ viewer.\n"
 	    "\n"
 	    "positional arguments:\n"
-	    "  FILE               output file (default: out)\n"
+	    "  FILE               output file pattern (default: out%%02d.png"
+	    " or out for raw output)\n"
 	    "\n"
 	    "optional arguments:\n"
 	    "  -h, --help         show this help message and exit\n"
@@ -66,6 +70,7 @@ usage(int status, const char *msg)
 	    "  -g, --gain VALUE   gain value (0.33 to 42.66,"
 	    " default: 1)\n"
 	    "  -n, --count N      number of image to take (default: 30)\n"
+	    "  -r, --raw          save raw images\n"
 	    , program_invocation_name);
     exit(status);
 }
@@ -78,6 +83,7 @@ parse_options(int argc, char **argv, struct options *options)
     options->exposure = 100.0;
     options->gain = 1.0;
     options->count = 30;
+    options->raw = false;
     options->out = NULL;
     char *tail;
     while (1) {
@@ -87,10 +93,11 @@ parse_options(int argc, char **argv, struct options *options)
 	    { "exposure", required_argument, 0, 'e' },
 	    { "gain", required_argument, 0, 'g' },
 	    { "count", required_argument, 0, 'n' },
+	    { "raw", required_argument, 0, 'r' },
 	    { NULL },
 	};
 	int option_index = 0;
-	int c = getopt_long(argc, argv, "hw:e:g:n:", long_options,
+	int c = getopt_long(argc, argv, "hw:e:g:n:r", long_options,
 		&option_index);
 	if (c == -1)
 	    break;
@@ -131,6 +138,9 @@ parse_options(int argc, char **argv, struct options *options)
 	    if (*tail != '\0' || errno)
 		usage(EXIT_FAILURE, "bad count value");
 	    break;
+	case 'r':
+	    options->raw = true;
+	    break;
 	case '?':
 	    usage(EXIT_FAILURE, NULL);
 	    break;
@@ -143,7 +153,14 @@ parse_options(int argc, char **argv, struct options *options)
     if (optind < argc)
 	usage(EXIT_FAILURE, "too many arguments");
     if (!options->out)
-	options->out = "out";
+	options->out = options->raw ? "out" : "out%02d.png";
+    if (!options->raw)
+    {
+	int argtypes[1];
+	int formats = parse_printf_format(options->out, 1, argtypes);
+	if (formats != 1 || argtypes[0] != PA_INT)
+	    usage(EXIT_FAILURE, "bad file pattern, use one %d");
+    }
 }
 
 libusb_device_handle *
@@ -322,19 +339,99 @@ device_uninit(libusb_device_handle *handle)
 }
 
 void
+bayer2rgb(uint8_t *bayer, uint8_t *rgb, int width, int height)
+{
+    /*
+     * Compute missing value using an average of its neighbours.
+     * Input pattern:
+     * G R G R G R
+     * B G B G B G
+     * G R G R G R
+     * B G B G B G
+     */
+    const int in_stride = width;
+    const int out_stride = width * 3;
+    /* Skip first line and column. */
+    uint8_t *in = bayer + in_stride + 1;
+    uint8_t *out = rgb + out_stride + 3;
+    /* Loop over lines. */
+    for (int i = 1; i < height - 1; i += 2) {
+	/* Even lines. */
+	uint8_t *in_stop = in + (width - 2);
+	while (in != in_stop) {
+	    *out++ = (in[-in_stride] + in[+in_stride] + 1) >> 1; /* R */
+	    *out++ = in[0];                                      /* G */
+	    *out++ = (in[-1] + in[+1] + 1) >> 1;                 /* B */
+	    in++;
+	    *out++ = (in[-in_stride - 1] + in[-in_stride + 1]    /* R */
+		    + in[+in_stride - 1] + in[+in_stride + 1] + 2) >> 2;
+	    *out++ = (in[-in_stride] + in[+in_stride]            /* G */
+		    + in[-1] + in[+1] + 2) >> 2;
+	    *out++ = in[0];                                      /* B */
+	    in++;
+	}
+	/* Fill first and last pixels. */
+	out[-(width - 1) * 3 + 0] = out[-(width - 2) * 3 + 0];
+	out[-(width - 1) * 3 + 1] = out[-(width - 2) * 3 + 1];
+	out[-(width - 1) * 3 + 2] = out[-(width - 2) * 3 + 2];
+	out[0] = out[-3];
+	out[1] = out[-2];
+	out[2] = out[-1];
+	out += out_stride - (width - 2) * 3;
+	in += in_stride - (width - 2);
+	/* Odd lines. */
+	in_stop = in + (width - 2);
+	while (in != in_stop) {
+	    *out++ = in[0];                                      /* R */
+	    *out++ = (in[-in_stride] + in[+in_stride]            /* G */
+		    + in[-1] + in[+1] + 2) >> 2;
+	    *out++ = (in[-in_stride - 1] + in[-in_stride + 1]    /* B */
+		    + in[+in_stride - 1] + in[+in_stride + 1] + 2) >> 2;
+	    in++;
+	    *out++ = (in[-1] + in[+1] + 1) >> 1;                 /* R */
+	    *out++ = in[0];                                      /* G */
+	    *out++ = (in[-in_stride] + in[+in_stride] + 1) >> 1; /* B */
+	    in++;
+	}
+	/* Fill first and last pixels. */
+	out[-(width - 1) * 3 + 0] = out[-(width - 2) * 3 + 0];
+	out[-(width - 1) * 3 + 1] = out[-(width - 2) * 3 + 1];
+	out[-(width - 1) * 3 + 2] = out[-(width - 2) * 3 + 2];
+	out[0] = out[-3];
+	out[1] = out[-2];
+	out[2] = out[-1];
+	out += out_stride - (width - 2) * 3;
+	in += in_stride - (width - 2);
+    }
+    /* Last line. */
+    out -= 3;
+    memcpy (out, out - out_stride, width * 3);
+    /* First line. */
+    out -= (height - 1) * out_stride;
+    memcpy (out, out + out_stride, width * 3);
+}
+
+void
 run(libusb_device_handle *handle, struct options *options)
 {
     int image_size = options->width * options->height;
     int frame_size = 16384;
     // Request an extra frame to read the zero length packet.
-    uint8_t data[(image_size + frame_size) / frame_size * frame_size];
-    FILE *out = fopen(options->out, "wb");
-    if (!out)
-	error(EXIT_FAILURE, errno, "can not open output file `%s'",
-		options->out);
+    int data_size = (image_size + frame_size) / frame_size * frame_size;
+    uint8_t *data = malloc(data_size);
+    if (!data)
+	error(EXIT_FAILURE, 0, "memory exhausted");
+    FILE *out = NULL;
+    uint8_t *rgb = NULL;
+    if (options->raw) {
+	out = fopen(options->out, "wb");
+	if (!out)
+	    error(EXIT_FAILURE, errno, "can not open output file `%s'",
+		    options->out);
+    }
     for (int i = 0; i < options->count;) {
 	int transfered = 0;
-	int r = libusb_bulk_transfer(handle, 0x83, data, sizeof(data),
+	int r = libusb_bulk_transfer(handle, 0x83, data, data_size,
 		&transfered, 0);
 	if (r)
 	    error(EXIT_FAILURE, 0, "can not read data: %s",
@@ -342,14 +439,41 @@ run(libusb_device_handle *handle, struct options *options)
 	if (transfered != image_size)
 	    fprintf(stderr, "bad image size (%d), drop\n", transfered);
 	else {
-	    fprintf(stderr, "write %d (%d)\n", i, transfered);
-	    r = fwrite(data, transfered, 1, out);
-	    if (r < 0)
-		error(EXIT_FAILURE, errno, "can not write");
+	    if (options->raw) {
+		fprintf(stderr, "write %d (%d)\n", i, transfered);
+		r = fwrite(data, transfered, 1, out);
+		if (r < 0)
+		    error(EXIT_FAILURE, errno, "can not write");
+	    } else {
+		char *name = NULL;
+		if (asprintf(&name, options->out, i) < 0)
+		    error(EXIT_FAILURE, 0, "can not prepare file name");
+		fprintf(stderr, "write %s\n", name);
+		if (!rgb) {
+		    rgb = malloc(image_size * 3);
+		    if (!rgb)
+			error(EXIT_FAILURE, 0, "memory exhausted");
+		}
+		bayer2rgb(data, rgb, options->width, options->height);
+		png_image image;
+		memset(&image, 0, sizeof(image));
+		image.version = PNG_IMAGE_VERSION;
+		image.width = options->width;
+		image.height = options->height;
+		image.format = PNG_FORMAT_RGB;
+		r = png_image_write_to_file(&image, name, 0, rgb, 0, NULL);
+		if (r == 0)
+		    error(EXIT_FAILURE, 0, "can not write image: %s",
+			    image.message);
+	    }
 	    i++;
 	}
     }
-    fclose(out);
+    free(data);
+    if (out)
+	fclose(out);
+    if (rgb)
+	free(rgb);
 }
 
 int
