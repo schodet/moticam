@@ -34,6 +34,8 @@
 #include <printf.h>
 #include <png.h>
 
+#include <SDL.h>
+
 #define ID_VENDOR 0x232f
 #define ID_PRODUCT 0x0100
 
@@ -69,7 +71,8 @@ usage(int status, const char *msg)
 	    " default: 100)\n"
 	    "  -g, --gain VALUE   gain value (0.33 to 42.66,"
 	    " default: 1)\n"
-	    "  -n, --count N      number of image to take (default: 30)\n"
+	    "  -n, --count N      number of image to take"
+	    " (default: live video)\n"
 	    "  -r, --raw          save raw images\n"
 	    , program_invocation_name);
     exit(status);
@@ -82,7 +85,7 @@ parse_options(int argc, char **argv, struct options *options)
     options->height = 768;
     options->exposure = 100.0;
     options->gain = 1.0;
-    options->count = 30;
+    options->count = 0;
     options->raw = false;
     options->out = NULL;
     char *tail;
@@ -339,7 +342,7 @@ device_uninit(libusb_device_handle *handle)
 }
 
 void
-bayer2rgb(uint8_t *bayer, uint8_t *rgb, int width, int height)
+bayer2argb(uint8_t *bayer, uint8_t *rgb, int width, int height)
 {
     /*
      * Compute missing value using an average of its neighbours.
@@ -350,65 +353,73 @@ bayer2rgb(uint8_t *bayer, uint8_t *rgb, int width, int height)
      * B G B G B G
      */
     const int in_stride = width;
-    const int out_stride = width * 3;
+    const int out_stride = width * 4;
     /* Skip first line and column. */
     uint8_t *in = bayer + in_stride + 1;
-    uint8_t *out = rgb + out_stride + 3;
+    uint8_t *out = rgb + out_stride + 4;
     /* Loop over lines. */
     for (int i = 1; i < height - 1; i += 2) {
 	/* Even lines. */
 	uint8_t *in_stop = in + (width - 2);
 	while (in != in_stop) {
-	    *out++ = (in[-in_stride] + in[+in_stride] + 1) >> 1; /* R */
-	    *out++ = in[0];                                      /* G */
 	    *out++ = (in[-1] + in[+1] + 1) >> 1;                 /* B */
+	    *out++ = in[0];                                      /* G */
+	    *out++ = (in[-in_stride] + in[+in_stride] + 1) >> 1; /* R */
+	    *out++ = 255;                                        /* A */
 	    in++;
-	    *out++ = (in[-in_stride - 1] + in[-in_stride + 1]    /* R */
-		    + in[+in_stride - 1] + in[+in_stride + 1] + 2) >> 2;
+	    *out++ = in[0];                                      /* B */
 	    *out++ = (in[-in_stride] + in[+in_stride]            /* G */
 		    + in[-1] + in[+1] + 2) >> 2;
-	    *out++ = in[0];                                      /* B */
+	    *out++ = (in[-in_stride - 1] + in[-in_stride + 1]    /* R */
+		    + in[+in_stride - 1] + in[+in_stride + 1] + 2) >> 2;
+	    *out++ = 255;                                        /* A */
 	    in++;
 	}
 	/* Fill first and last pixels. */
-	out[-(width - 1) * 3 + 0] = out[-(width - 2) * 3 + 0];
-	out[-(width - 1) * 3 + 1] = out[-(width - 2) * 3 + 1];
-	out[-(width - 1) * 3 + 2] = out[-(width - 2) * 3 + 2];
-	out[0] = out[-3];
-	out[1] = out[-2];
-	out[2] = out[-1];
-	out += out_stride - (width - 2) * 3;
+	out[-(width - 1) * 4 + 0] = out[-(width - 2) * 4 + 0];
+	out[-(width - 1) * 4 + 1] = out[-(width - 2) * 4 + 1];
+	out[-(width - 1) * 4 + 2] = out[-(width - 2) * 4 + 2];
+	out[-(width - 1) * 4 + 3] = out[-(width - 2) * 4 + 3];
+	out[0] = out[-4];
+	out[1] = out[-3];
+	out[2] = out[-2];
+	out[3] = out[-1];
+	out += out_stride - (width - 2) * 4;
 	in += in_stride - (width - 2);
 	/* Odd lines. */
 	in_stop = in + (width - 2);
 	while (in != in_stop) {
-	    *out++ = in[0];                                      /* R */
-	    *out++ = (in[-in_stride] + in[+in_stride]            /* G */
-		    + in[-1] + in[+1] + 2) >> 2;
 	    *out++ = (in[-in_stride - 1] + in[-in_stride + 1]    /* B */
 		    + in[+in_stride - 1] + in[+in_stride + 1] + 2) >> 2;
+	    *out++ = (in[-in_stride] + in[+in_stride]            /* G */
+		    + in[-1] + in[+1] + 2) >> 2;
+	    *out++ = in[0];                                      /* R */
+	    *out++ = 255;                                        /* A */
 	    in++;
-	    *out++ = (in[-1] + in[+1] + 1) >> 1;                 /* R */
-	    *out++ = in[0];                                      /* G */
 	    *out++ = (in[-in_stride] + in[+in_stride] + 1) >> 1; /* B */
+	    *out++ = in[0];                                      /* G */
+	    *out++ = (in[-1] + in[+1] + 1) >> 1;                 /* R */
+	    *out++ = 255;                                        /* A */
 	    in++;
 	}
 	/* Fill first and last pixels. */
-	out[-(width - 1) * 3 + 0] = out[-(width - 2) * 3 + 0];
-	out[-(width - 1) * 3 + 1] = out[-(width - 2) * 3 + 1];
-	out[-(width - 1) * 3 + 2] = out[-(width - 2) * 3 + 2];
-	out[0] = out[-3];
-	out[1] = out[-2];
-	out[2] = out[-1];
-	out += out_stride - (width - 2) * 3;
+	out[-(width - 1) * 4 + 0] = out[-(width - 2) * 4 + 0];
+	out[-(width - 1) * 4 + 1] = out[-(width - 2) * 4 + 1];
+	out[-(width - 1) * 4 + 2] = out[-(width - 2) * 4 + 2];
+	out[-(width - 1) * 4 + 3] = out[-(width - 2) * 4 + 3];
+	out[0] = out[-4];
+	out[1] = out[-3];
+	out[2] = out[-2];
+	out[3] = out[-1];
+	out += out_stride - (width - 2) * 4;
 	in += in_stride - (width - 2);
     }
     /* Last line. */
-    out -= 3;
-    memcpy (out, out - out_stride, width * 3);
+    out -= 4;
+    memcpy (out, out - out_stride, width * 4);
     /* First line. */
     out -= (height - 1) * out_stride;
-    memcpy (out, out + out_stride, width * 3);
+    memcpy (out, out + out_stride, width * 4);
 }
 
 void
@@ -450,17 +461,17 @@ run(libusb_device_handle *handle, struct options *options)
 		    error(EXIT_FAILURE, 0, "can not prepare file name");
 		fprintf(stderr, "write %s\n", name);
 		if (!rgb) {
-		    rgb = malloc(image_size * 3);
+		    rgb = malloc(image_size * 4);
 		    if (!rgb)
 			error(EXIT_FAILURE, 0, "memory exhausted");
 		}
-		bayer2rgb(data, rgb, options->width, options->height);
+		bayer2argb(data, rgb, options->width, options->height);
 		png_image image;
 		memset(&image, 0, sizeof(image));
 		image.version = PNG_IMAGE_VERSION;
 		image.width = options->width;
 		image.height = options->height;
-		image.format = PNG_FORMAT_RGB;
+		image.format = PNG_FORMAT_BGRA;
 		r = png_image_write_to_file(&image, name, 0, rgb, 0, NULL);
 		if (r == 0)
 		    error(EXIT_FAILURE, 0, "can not write image: %s",
@@ -474,6 +485,74 @@ run(libusb_device_handle *handle, struct options *options)
 	fclose(out);
     if (rgb)
 	free(rgb);
+}
+
+void
+run_video(libusb_device_handle *handle, struct options *options)
+{
+    if (SDL_Init(SDL_INIT_VIDEO))
+	error(EXIT_FAILURE, 0, "unable to initialize SDL: %s",
+		SDL_GetError());
+    atexit(SDL_Quit);
+    SDL_DisableScreenSaver();
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    if (SDL_CreateWindowAndRenderer(options->width, options->height,
+	    SDL_WINDOW_RESIZABLE, &window, &renderer))
+	error(EXIT_FAILURE, 0, "unable to create window: %s", SDL_GetError());
+    SDL_SetWindowTitle(window, "Moticam");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    if (SDL_RenderSetLogicalSize(renderer, options->width, options->height))
+	error(EXIT_FAILURE, 0, "can not set logical size: %s", SDL_GetError());
+    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32,
+	    SDL_TEXTUREACCESS_STREAMING, options->width, options->height);
+    if (!texture)
+	error(EXIT_FAILURE, 0, "can not create texture: %s", SDL_GetError());
+    int image_size = options->width * options->height;
+    int frame_size = 16384;
+    int data_size = (image_size + frame_size) / frame_size * frame_size;
+    uint8_t *data = malloc(data_size);
+    if (!data)
+	error(EXIT_FAILURE, 0, "memory exhausted");
+    uint8_t *rgb = malloc(image_size * 4);
+    if (!rgb)
+	error(EXIT_FAILURE, 0, "memory exhausted");
+    bool exit = false;
+    while (1) {
+	SDL_Event event;
+	while (SDL_PollEvent(&event)) {
+	    if (event.type == SDL_QUIT)
+		exit = true;
+	    if (event.type == SDL_KEYDOWN
+		    && (event.key.keysym.sym == SDLK_q
+			|| event.key.keysym.sym == SDLK_ESCAPE))
+		exit = true;
+	}
+	if (exit)
+	    break;
+	int transfered = 0;
+	int r = libusb_bulk_transfer(handle, 0x83, data, data_size,
+		&transfered, 0);
+	if (r)
+	    error(EXIT_FAILURE, 0, "can not read data: %s",
+		    libusb_strerror(r));
+	if (transfered != image_size)
+	    fprintf(stderr, "bad image size (%d), drop\n", transfered);
+	else {
+	    bayer2argb(data, rgb, options->width, options->height);
+	    SDL_UpdateTexture(texture, NULL, rgb, options->width * 4);
+	    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+	    SDL_RenderClear(renderer);
+	    SDL_RenderCopyEx(renderer, texture, NULL, NULL, 180.0, NULL,
+		    SDL_FLIP_NONE);
+	    SDL_RenderPresent(renderer);
+	}
+    }
+    free(rgb);
+    free(data);
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
 }
 
 int
@@ -490,7 +569,10 @@ main(int argc, char **argv)
     if (!handle)
 	error(EXIT_FAILURE, 0, "unable to find device");
     device_init(handle, &options);
-    run(handle, &options);
+    if (options.count)
+	run(handle, &options);
+    else
+	run_video(handle, &options);
     device_uninit(handle);
     libusb_close(handle);
     libusb_exit(usb);
